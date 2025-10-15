@@ -1,16 +1,16 @@
 import json
 import os
-import time
-import threading
 from datetime import datetime
 from typing import Dict, Any
 import redis
 import requests
-import schedule
 from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel
 import uvicorn
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
+import pytz
 
 load_dotenv()
 
@@ -38,6 +38,10 @@ redis_client = redis.Redis(
     decode_responses=True
 )
 
+# Usar APScheduler ao invés de schedule
+scheduler = BackgroundScheduler(timezone=pytz.UTC)
+scheduler.start()
+
 class ScheduleMessage(BaseModel):
     id: str
     scheduleTo: str
@@ -48,31 +52,37 @@ def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any]):
     try:
         response = requests.post(webhook_url, json=payload, timeout=30)
         response.raise_for_status()
-        print(f"Webhook fired successfully for message {message_id}")
+        print(f"[{datetime.now().isoformat()}] Webhook fired successfully for message {message_id}")
     except Exception as e:
-        print(f"Failed to fire webhook for message {message_id}: {e}")
+        print(f"[{datetime.now().isoformat()}] Failed to fire webhook for message {message_id}: {e}")
     finally:
         redis_client.delete(f"message:{message_id}")
-        print(f"Message {message_id} cleaned from Redis")
+        print(f"[{datetime.now().isoformat()}] Message {message_id} cleaned from Redis")
 
 def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str, payload: Dict[str, Any]):
+    # Parse da data ISO com timezone
     schedule_time = datetime.fromisoformat(schedule_timestamp.replace('Z', '+00:00'))
-    current_time = datetime.now(schedule_time.tzinfo)
+    current_time = datetime.now(pytz.UTC)
     
+    # Se a data já passou, executa imediatamente
     if schedule_time <= current_time:
+        print(f"[{datetime.now().isoformat()}] Schedule time in the past, firing immediately - ID: {message_id}")
         fire_webhook(message_id, webhook_url, payload)
         return
     
-    def job():
-        fire_webhook(message_id, webhook_url, payload)
-        return schedule.CancelJob
-    
-    schedule.every().day.at(schedule_time.strftime("%H:%M")).do(job).tag(message_id)
-
-def scheduler_worker():
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    # Agenda para a data específica usando APScheduler
+    try:
+        scheduler.add_job(
+            fire_webhook,
+            trigger=DateTrigger(run_date=schedule_time),
+            args=[message_id, webhook_url, payload],
+            id=message_id,
+            replace_existing=True
+        )
+        print(f"[{datetime.now().isoformat()}] Job scheduled for {schedule_time.isoformat()} - ID: {message_id}")
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] Failed to schedule job - ID: {message_id}, Error: {e}")
+        raise
 
 def restore_scheduled_messages():
     try:
@@ -100,9 +110,6 @@ def restore_scheduled_messages():
         print(f"[{datetime.now().isoformat()}] Error restoring messages: {e}")
 
 restore_scheduled_messages()
-
-scheduler_thread = threading.Thread(target=scheduler_worker, daemon=True)
-scheduler_thread.start()
 
 @app.post("/messages")
 async def create_scheduled_message(message: ScheduleMessage, token: str = Depends(verify_token)):
@@ -145,7 +152,12 @@ async def delete_scheduled_message(message_id: str, token: str = Depends(verify_
         
         redis_client.delete(redis_key)
         
-        schedule.clear(message_id)
+        # Remove o job do APScheduler
+        try:
+            scheduler.remove_job(message_id)
+            print(f"[{datetime.now().isoformat()}] Job removed from scheduler - ID: {message_id}")
+        except Exception as e:
+            print(f"[{datetime.now().isoformat()}] Job not found in scheduler (may have already run) - ID: {message_id}")
         
         return {"status": "deleted", "messageId": message_id}
     
@@ -160,11 +172,11 @@ async def delete_scheduled_message(message_id: str, token: str = Depends(verify_
 async def list_scheduled_messages(token: str = Depends(verify_token)):
     try:
         jobs = []
-        for job in schedule.jobs:
+        for job in scheduler.get_jobs():
             jobs.append({
-                "messageId": list(job.tags)[0] if job.tags else "unknown",
-                "nextRun": job.next_run.isoformat() if job.next_run else None,
-                "job": str(job.job_func)
+                "messageId": job.id,
+                "nextRun": job.next_run_time.isoformat() if job.next_run_time else None,
+                "trigger": str(job.trigger)
             })
         
         return {"scheduledJobs": jobs, "count": len(jobs)}
@@ -177,9 +189,19 @@ async def list_scheduled_messages(token: str = Depends(verify_token)):
 async def health_check():
     try:
         redis_client.ping()
-        return {"status": "healthy", "redis": "connected"}
+        scheduler_status = "running" if scheduler.running else "stopped"
+        return {
+            "status": "healthy",
+            "redis": "connected",
+            "scheduler": scheduler_status,
+            "scheduled_jobs": len(scheduler.get_jobs())
+        }
     except Exception as e:
         return {"status": "unhealthy", "redis": "disconnected", "error": str(e)}
+
+@app.on_event("shutdown")
+def shutdown_event():
+    scheduler.shutdown()
 
 if __name__ == "__main__":
     print(f"[{datetime.now().isoformat()}] Starting Scheduler API server")
